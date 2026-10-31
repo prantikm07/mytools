@@ -1,10 +1,17 @@
-import React, { useRef, useState } from 'react';
+import React, { useState } from 'react';
 import { fmtBytes, postForm } from '../api';
 import Dropzone from '../components/Dropzone';
 import Workspace from '../components/Workspace';
 import { Field, NumInput, Select, Slider, Toggle } from '../components/ui';
+import * as C from '../client';
 
-/* ============================================================ ADVANCED IMAGE COMPRESSOR */
+const resultsOf = (list) => list.map((r) => ({
+  blob: r.blob, filename: r.filename,
+  preview: r.blob.type.startsWith('image/') ? URL.createObjectURL(r.blob) : null,
+  meta: fmtBytes(r.blob.size),
+}));
+
+/* ============================================================ ADVANCED IMAGE COMPRESSOR — 100% client-side (WebAssembly) */
 export function ImageCompressor({ tool }) {
   const [files, setFiles] = useState([]);
   const [quality, setQuality] = useState(80);
@@ -17,19 +24,26 @@ export function ImageCompressor({ tool }) {
   const [strip, setStrip] = useState(true);
 
   const run = async () => {
-    const fd = new FormData();
-    files.forEach((f) => fd.append('files', f));
-    fd.append('quality', quality);
-    fd.append('max_width', maxW || 0);
-    fd.append('max_height', maxH || 0);
-    fd.append('target_kb', useTarget ? targetKB : 0);
-    fd.append('dpi', dpi || 0);
-    fd.append('fmt', fmt);
-    fd.append('strip', strip);
-    const { blob, filename } = await postForm('/api/images/compress', fd);
-    const preview = blob.type.startsWith('image/') ? URL.createObjectURL(blob) : null;
-    return [{ blob, filename: filename || `compressed.${fmt || 'jpg'}`, preview,
-      meta: `${fmtBytes(files.reduce((a, f) => a + f.size, 0))} → ${fmtBytes(blob.size)}` }];
+    const opts = { quality, maxW: +maxW || 0, maxH: +maxH || 0, targetKB: useTarget ? (+targetKB || 0) : 0, dpi, fmt };
+    const out = [];
+    for (const f of files) {
+      if (!C.isImageFile(f)) throw new Error(`${f.name} is not an image`);
+      try {
+        out.push(await C.compressImage(f, opts));
+      } catch {
+        // exotic format the browser can't decode → fall back to backend if configured
+        const fd = new FormData();
+        fd.append('file', f);
+        fd.append('quality', quality); fd.append('max_width', opts.maxW); fd.append('max_height', opts.maxH);
+        fd.append('target_kb', opts.targetKB); fd.append('dpi', dpi); fd.append('fmt', fmt); fd.append('strip', String(strip));
+        const { blob, filename } = await postForm('/api/images/compress', fd);
+        out.push({ blob, filename });
+      }
+    }
+    const totalIn = files.reduce((a, f) => a + f.size, 0);
+    const totalOut = out.reduce((a, r) => a + r.blob.size, 0);
+    return resultsOf(out).map((r) => ({ ...r,
+      meta: `${fmtBytes(totalIn)} → ${fmtBytes(totalOut)} (${Math.max(0, Math.round((1 - totalOut / totalIn) * 100))}% saved)` }));
   };
 
   return (
@@ -62,22 +76,23 @@ export function ImageCompressor({ tool }) {
             )}
             <Toggle checked={strip} onChange={setStrip} label="Strip EXIF / metadata" />
           </div>
+          <p className="md:col-span-2 text-xs text-zinc-500">Runs entirely in your browser (WebAssembly) — files never leave your device.</p>
         </div>
       )}
       run={run} />
   );
 }
 
-/* ============================================================ simple server-backed image tools */
+/* ============================================================ simple image tools — client-side */
 export function SimpleImageTool({ tool }) {
   const cfg = {
-    convert: { path: '/api/images/convert', extra: (s) => { s.fd.append('fmt', s.fmt); s.fd.append('quality', 92); },
+    convert: {
       controls: (s) => <Field label="Output format"><Select value={s.fmt} onChange={(e) => s.setFmt(e.target.value)} options={[
         { value: 'jpg', label: 'JPG' }, { value: 'png', label: 'PNG' }, { value: 'webp', label: 'WEBP' }]} /></Field>,
-      state: { fmt: 'jpg' } },
-    resize: { path: '/api/images/resize', extra: (s) => {
-        s.fd.append('width', s.w || 0); s.fd.append('height', s.h || 0);
-        s.fd.append('percent', s.pct || 0); s.fd.append('keep_aspect', s.keep); },
+      state: { fmt: 'jpg' },
+      fn: (f, s) => C.convertImage(f, s.fmt, 92),
+    },
+    resize: {
       controls: (s) => (<>
         <div className="grid grid-cols-3 gap-3">
           <Field label="Width (px)"><NumInput min="0" value={s.w} onChange={(e) => s.setW(e.target.value)} /></Field>
@@ -85,10 +100,10 @@ export function SimpleImageTool({ tool }) {
           <Field label="Percent %"><NumInput min="0" max="1000" placeholder="e.g. 50" value={s.pct} onChange={(e) => s.setPct(e.target.value)} /></Field>
         </div>
         <Toggle checked={s.keep} onChange={s.setKeep} label="Maintain aspect ratio" /></>),
-      state: { w: '', h: '', pct: '', keep: true } },
-    crop: { path: '/api/images/crop', extra: (s) => {
-        s.fd.append('x', s.x || 0); s.fd.append('y', s.y || 0);
-        s.fd.append('w', s.w || 0); s.fd.append('h', s.h || 0); s.fd.append('aspect', s.aspect); },
+      state: { w: '', h: '', pct: '', keep: true },
+      fn: (f, s) => C.resizeImage(f, { width: +s.w || 0, height: +s.h || 0, percent: +s.pct || 0, keepAspect: s.keep }),
+    },
+    crop: {
       controls: (s) => (<>
         <Field label="Aspect preset (overrides geometry, centered)">
           <Select value={s.aspect} onChange={(e) => s.setAspect(e.target.value)} options={[
@@ -101,16 +116,19 @@ export function SimpleImageTool({ tool }) {
           <Field label="Width"><NumInput value={s.w} min="0" onChange={(e) => s.setW(e.target.value)} /></Field>
           <Field label="Height"><NumInput value={s.h} min="0" onChange={(e) => s.setH(e.target.value)} /></Field>
         </div>}</>),
-      state: { x: '', y: '', w: '', h: '', aspect: '' } },
-    transform: { path: '/api/images/transform', extra: (s) => {
-        s.fd.append('angle', s.angle); s.fd.append('flip_h', s.fh); s.fd.append('flip_v', s.fv); },
+      state: { x: '', y: '', w: '', h: '', aspect: '' },
+      fn: (f, s) => C.cropImage(f, { x: +s.x || 0, y: +s.y || 0, w: +s.w || 0, h: +s.h || 0, aspect: s.aspect }),
+    },
+    transform: {
       controls: (s) => (<>
         <Field label="Rotate"><Select value={String(s.angle)} onChange={(e) => s.setAngle(Number(e.target.value))} options={[
           { value: '0', label: 'None' }, { value: '90', label: '90° clockwise' },
           { value: '180', label: '180°' }, { value: '270', label: '270° clockwise' }]} /></Field>
         <Toggle checked={s.fh} onChange={s.setFh} label="Flip horizontal (mirror)" />
         <Toggle checked={s.fv} onChange={s.setFv} label="Flip vertical" /></>),
-      state: { angle: 0, fh: false, fv: false } },
+      state: { angle: 0, fh: false, fv: false },
+      fn: (f, s) => C.transformImage(f, { angle: s.angle, flipH: s.fh, flipV: s.fv }),
+    },
   }[tool.id];
 
   const init = cfg.state;
@@ -119,20 +137,14 @@ export function SimpleImageTool({ tool }) {
   Object.keys(init).forEach((k) => { const [v, sv] = useState(init[k]); st[k] = v; setters['set' + k[0].toUpperCase() + k.slice(1)] = sv; });
 
   const run = async () => {
-    const fd = new FormData();
-    files.forEach((f) => fd.append('files', f));
-    const session = { fd, ...st, ...setters };
-    cfg.extra(session);
-    const { blob, filename } = await postForm(cfg.path, fd);
-    if (blob.type === 'application/zip') {
-      return [{ blob, filename: filename || 'result.zip', meta: fmtBytes(blob.size) }];
-    }
-    return [{ blob, filename: filename || 'result.png', preview: URL.createObjectURL(blob), meta: fmtBytes(blob.size) }];
+    const out = [];
+    for (const f of files) out.push(await cfg.fn(f, st));
+    return resultsOf(out);
   };
 
   return (
     <Workspace tool={tool} files={files} setFiles={setFiles}
-      DropArea={({ files, onChange }) => <Dropzone accept=".jpg,.jpeg,.png,.webp,.gif,.bmp,.tiff" files={files} onChange={onChange} />}
+      DropArea={({ files, onChange }) => <Dropzone accept=".jpg,.jpeg,.png,.webp,.gif,.bmp" files={files} onChange={onChange} />}
       Controls={() => cfg.controls(st)} run={run} />
   );
 }
@@ -147,11 +159,8 @@ export function ImageMerge({ tool }) {
 
   const run = async () => {
     if (files.length < 2) throw new Error('Add at least two images to merge.');
-    const fd = new FormData();
-    files.forEach((f) => fd.append('files', f));
-    fd.append('mode', mode); fd.append('gap', gap); fd.append('columns', cols); fd.append('bg', bg);
-    const { blob, filename } = await postForm('/api/images/merge', fd);
-    return [{ blob, filename: filename || 'merged.png', preview: URL.createObjectURL(blob), meta: fmtBytes(blob.size) }];
+    const r = await C.mergeImages(files, { mode, gap: +gap || 0, columns: +cols || 2, bg });
+    return resultsOf([r]);
   };
 
   return (
@@ -172,7 +181,7 @@ export function ImageMerge({ tool }) {
   );
 }
 
-/* ============================================================ IMAGES <-> GIF */
+/* ============================================================ IMAGES <-> GIF — client-side */
 export function GifTools({ tool }) {
   const [files, setFiles] = useState([]);
   const [delay, setDelay] = useState(100);
@@ -180,16 +189,12 @@ export function GifTools({ tool }) {
   const [fmt, setFmt] = useState('png');
 
   const run = async () => {
-    const fd = new FormData();
     if (tool.id === 'img2gif') {
-      files.forEach((f) => fd.append('files', f));
-      fd.append('delay', delay); fd.append('loop', loop ? 0 : 1);
-      const { blob, filename } = await postForm('/api/images/to-gif', fd);
-      return [{ blob, filename: filename || 'animation.gif', preview: URL.createObjectURL(blob), meta: fmtBytes(blob.size) }];
+      const r = await C.imagesToGif(files, { delay: +delay, loop });
+      return [{ blob: r.blob, filename: r.filename, preview: URL.createObjectURL(r.blob), meta: fmtBytes(r.blob.size) }];
     }
-    fd.append('file', files[0]); fd.append('fmt', fmt);
-    const { blob, filename } = await postForm('/api/images/gif-extract', fd);
-    return [{ blob, filename: filename || 'frames.zip', meta: fmtBytes(blob.size) }];
+    const frames = await C.gifExtractFrames(files[0], fmt);
+    return resultsOf(frames);
   };
 
   return (
