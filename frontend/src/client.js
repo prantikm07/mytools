@@ -205,7 +205,6 @@ export async function compressImage(file, opts) {
     }
   }
   if (dpi) { try { best = await encodeWithDpi(paintTo(decoded, w, h, 'fill'), outFmt === 'gif' ? 'png' : outFmt, quality, dpi).then((r) => r.blob); } catch { /* ignore */ } }
-  void loop;
   const name = `${baseOf(file.name)}-compressed.${outFmt === 'jpeg' ? 'jpg' : (outFmt === 'gif' ? 'png' : outFmt)}`;
   return { blob: best, filename: name };
 }
@@ -366,6 +365,43 @@ export async function gifExtractFrames(file, fmt = 'png') {
   return [{ blob, filename: `${baseOf(file.name)}-frame-001.${ext}` }];
 }
 
+/* ============================================================ API fallbacks
+   When a client-side engine cannot handle something (encrypted PDF, exotic
+   format, password protect/unlock), we fall back to the API layer:
+     • Netlify deploy  → /api/* is rewritten to netlify/functions/api.mjs
+       (sharp + pdf-lib + MuPDF-wasm + segno — all free & open source).
+     • Self-hosted     → VITE_API_URL points at the FastAPI backend.
+   If neither exists the request fails with a friendly, actionable message. */
+async function apiFallback(path, formData) {
+  const base = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+  let res;
+  try {
+    res = await fetch(base + path, { method: 'POST', body: formData });
+  } catch {
+    throw new Error('Network error — could not reach the processing service.');
+  }
+  if (!res.ok) {
+    let detail = `Service error (HTTP ${res.status})`;
+    try {
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('json')) detail = (await res.json()).detail || detail;
+    } catch { /* non-JSON error body */ }
+    throw new Error(detail);
+  }
+  const cd = res.headers.get('content-disposition') || '';
+  const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+  const filename = m ? decodeURIComponent(m[1]) : 'result';
+  return { blob: await res.blob(), filename };
+}
+
+export async function pdfProtectOrUnlock(file, { password = '', mode = 'protect' }) {
+  const fd = new FormData();
+  fd.append('file', file);
+  fd.append('password', password);
+  const { blob, filename } = await apiFallback(`/api/pdf/${mode}`, fd);
+  return { blob, filename: filename || `${baseOf(file.name)}-${mode === 'unlock' ? 'unlocked' : 'protected'}.pdf` };
+}
+
 /* ============================================================ PDF (client) */
 let _pdfDocLib = null;
 async function pdfLib() {
@@ -376,19 +412,41 @@ let _pdfjsWorkerDone = false;
 async function pdfjs() {
   const lib = await import('pdfjs-dist/build/pdf.mjs');
   if (!_pdfjsWorkerDone) {
-    const workerUrl = new URL('pdfjs-dist/build/pdf.worker.min.mjs', import.meta.url);
-    lib.GlobalWorkerOptions.workerSrc = workerUrl.href;
+    // The worker must be an inlined Blob module (works on static hosts like
+    // Netlify where no separate worker file route exists). A CDN copy of the
+    // MIT-licensed pdf.js worker is used as a fallback for older browsers.
+    try {
+      const mod = await import('pdfjs-dist/build/pdf.worker.min.mjs?worker&inline');
+      lib.GlobalWorkerOptions.workerPort = new mod.default().port;
+    } catch {
+      const ver = '5.6.205';
+      lib.GlobalWorkerOptions.workerSrc =
+        `https://cdn.jsdelivr.net/npm/pdfjs-dist@${ver}/build/pdf.worker.min.mjs`;
+    }
     _pdfjsWorkerDone = true;
   }
   return lib;
+}
+
+async function loadPdfDoc(file, { allowEncrypted = false } = {}) {
+  const { PDFDocument } = await pdfLib();
+  let doc;
+  try {
+    doc = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: allowEncrypted });
+  } catch {
+    throw new Error(`"${file.name}" could not be opened — it may be corrupted or password-protected.`);
+  }
+  if (doc.isEncrypted && !allowEncrypted) {
+    throw new Error(`"${file.name}" is password-protected. Unlock it first with the Unlock PDF tool.`);
+  }
+  return { PDFDocument, doc };
 }
 
 export async function pdfMerge(files) {
   const { PDFDocument } = await pdfLib();
   const out = await PDFDocument.create();
   for (const f of files) {
-    const src = await PDFDocument.load(await f.arrayBuffer(), { ignoreEncryption: true });
-    if (src.isEncrypted) throw new Error(`${f.name} is password-protected — unlock it first`);
+    const { doc: src } = await loadPdfDoc(f);
     (await out.copyPages(src, src.getPageIndices())).forEach((p) => out.addPage(p));
   }
   return { blob: new Blob([await out.save()], { type: 'application/pdf' }), filename: 'merged.pdf' };
@@ -405,9 +463,7 @@ function parseRanges(spec, total) {
 }
 
 export async function pdfSplit(file, { mode = 'ranges', ranges = '1-1', every = 1 }) {
-  const { PDFDocument } = await pdfLib();
-  const doc = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
-  if (doc.isEncrypted) throw new Error('PDF is password-protected');
+  const { PDFDocument, doc } = await loadPdfDoc(file);
   const total = doc.getPageCount();
   const mkDoc = async (idxs) => { const nd = await PDFDocument.create(); (await nd.copyPages(doc, idxs)).forEach((p) => nd.addPage(p)); return new Blob([await nd.save()], { type: 'application/pdf' }); };
   const base = baseOf(file.name);
@@ -419,9 +475,8 @@ export async function pdfSplit(file, { mode = 'ranges', ranges = '1-1', every = 
 }
 
 export async function pdfRotate(file, { angle = 90, pagesSpec = '' }) {
-  const { PDFDocument, degrees } = await pdfLib();
-  const doc = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
-  if (doc.isEncrypted) throw new Error('PDF is password-protected');
+  const { degrees } = await pdfLib();
+  const { doc } = await loadPdfDoc(file);
   const targets = pagesSpec.trim() ? parseRanges(pagesSpec, doc.getPageCount()) : doc.getPages().map((_, i) => i);
   const pages = doc.getPages();
   for (const i of targets) { let r = (pages[i].getRotation().angle + angle) % 360; if (r < 0) r += 360; pages[i].setRotation(degrees(r)); }
@@ -432,7 +487,7 @@ export async function pdfToImages(file, { dpi = 150, fmt = 'png' }) {
   const lib = await pdfjs();
   const task = lib.getDocument({ data: await file.arrayBuffer() });
   const doc = await task.promise;
-  if (doc.isEncrypted) { try { await doc.checkPermissions?.(); } catch { throw new Error('PDF is password-protected'); } }
+  if (doc.isEncrypted) { try { await doc.checkPermissions?.(); } catch { throw new Error(`"${file.name}" is password-protected. Unlock it first with the Unlock PDF tool.`); } }
   const base = baseOf(file.name);
   const out = [];
   const scale = Math.max(36, dpi) / 72;
@@ -480,9 +535,8 @@ export async function imagesToPdf(files, { pageSize = 'fit', margin = 0 }) {
 }
 
 export async function pdfWatermark(file, opts) {
-  const { PDFDocument, StandardFonts, rgb, degrees } = await pdfLib();
-  const doc = await PDFDocument.load(await file.arrayBuffer(), { ignoreEncryption: true });
-  if (doc.isEncrypted) throw new Error('PDF is password-protected');
+  const { StandardFonts, rgb, degrees } = await pdfLib();
+  const { doc } = await loadPdfDoc(file);
   const { text = 'CONFIDENTIAL', opacity = 0.15, size = 48, position = 'center', tile = false, rotate = true, color = '#a3e635', imageFile = null } = opts;
   const hex = String(color).replace('#', '');
   const col = rgb(parseInt(hex.slice(0, 2), 16) / 255 || 0.64, parseInt(hex.slice(2, 4), 16) / 255 || 0.9, parseInt(hex.slice(4, 6), 16) / 255 || 0.2);
@@ -533,7 +587,7 @@ export async function pdfCompress(file, opts) {
   const { PDFDocument } = await pdfLib();
   const task = lib.getDocument({ data: await file.arrayBuffer() });
   const doc = await task.promise;
-  if (doc.isEncrypted) throw new Error('PDF is password-protected');
+  if (doc.isEncrypted) throw new Error(`"${file.name}" is password-protected. Unlock it first with the Unlock PDF tool.`);
   const out = await PDFDocument.create();
   const scale = Math.max(36, D) / 72;
   for (let i = 1; i <= doc.numPages; i++) {

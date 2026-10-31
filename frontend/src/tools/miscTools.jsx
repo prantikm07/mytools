@@ -4,6 +4,65 @@ import Dropzone from '../components/Dropzone';
 import Workspace from '../components/Workspace';
 import { Field, NumInput, Select, Slider, Toggle } from '../components/ui';
 
+/* Client-side audio converter fallback using the Web Audio API. */
+async function extractAudioClient(file, fmt, bitrate) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  const ctx = new AC();
+  let buf;
+  try {
+    buf = await ctx.decodeAudioData(await file.arrayBuffer());
+  } finally { ctx.close().catch(() => {}); }
+  const base = file.name.replace(/\.[^.]+$/, '').replace(/[^\w.-]/g, '_');
+  if (fmt === 'wav') {
+    const blob = encodeWav(buf);
+    return { blob, filename: `${base}.${fmt}` };
+  }
+  // Encode via MediaEncoder where available (opus/vorbis/mp3 vary by browser), else fall back to WAV.
+  const mimeMap = { mp3: 'audio/mpeg', aac: 'audio/aac', ogg: 'audio/ogg' };
+  const mime = mimeMap[fmt];
+  if (mime && typeof MediaRecorder !== 'undefined' && MediaRecorder.isTypeSupported?.(mime)) {
+    const blob = await recordWithMediaEncoder(buf, mime, Number(bitrate) * 1000);
+    if (blob && blob.size) return { blob, filename: `${base}.${fmt}` };
+  }
+  return { blob: encodeWav(buf), filename: `${base}.wav` };
+}
+
+function encodeWav(audioBuf) {
+  const numCh = audioBuf.numberOfChannels, rate = audioBuf.sampleRate, len = audioBuf.length;
+  const bytes = 44 + len * numCh * 2;
+  const ab = new ArrayBuffer(bytes);
+  const view = new DataView(ab);
+  const wrstr = (o, str) => { for (let i = 0; i < str.length; i++) view.setUint8(o + i, str.charCodeAt(i)); };
+  wrstr(0, 'RIFF'); view.setUint32(4, bytes - 8, true); wrstr(8, 'WAVE');
+  wrstr(12, 'fmt '); view.setUint32(16, 16, true); view.setUint16(20, 1, true);
+  view.setUint16(22, numCh, true); view.setUint32(24, rate, true);
+  view.setUint32(28, rate * numCh * 2, true); view.setUint16(32, numCh * 2, true); view.setUint16(34, 16, true);
+  wrstr(36, 'data'); view.setUint32(40, len * numCh * 2, true);
+  const chans = []; for (let c = 0; c < numCh; c++) chans.push(audioBuf.getChannelData(c));
+  let off = 44;
+  for (let i = 0; i < len; i++) for (let c = 0; c < numCh; c++) {
+    const v = Math.max(-1, Math.min(1, chans[c][i]));
+    view.setInt16(off, v < 0 ? v * 0x8000 : v * 0x7fff, true); off += 2;
+  }
+  return new Blob([ab], { type: 'audio/wav' });
+}
+
+async function recordWithMediaEncoder(audioBuf, mime, bitrate) {
+  if (typeof AudioEncoder === 'undefined') return null; // no WebCodecs
+  const chunks = [];
+  const encoder = new AudioEncoder({ output: (c) => chunks.push(c) });
+  try {
+    encoder.configure({ codec: mime.includes('mpeg') ? 'mp4a.40.2' : mime.includes('aac') ? 'mp4a.40.2' : 'opus', sampleRate: audioBuf.sampleRate, bitrate });
+    const frameData = { format: 'f32', sampleRate: audioBuf.sampleRate, numberOfChannels: audioBuf.numberOfChannels, length: audioBuf.length,
+      channelData: Array.from({ length: audioBuf.numberOfChannels }, (_, c) => audioBuf.getChannelData(c)) };
+    const frame = new AudioData(frameData);
+    encoder.encode(frame); frame.close();
+    await encoder.flush();
+    const blobParts = await Promise.all(chunks.map(async (c) => c.byteLength ? await c.copyTo(new Uint8Array(c.byteLength)) : null));
+    return new Blob(blobParts.filter(Boolean), { type: mime });
+  } catch { return null; } finally { try { encoder.close(); } catch {} }
+}
+
 /* ============================================================ VIDEO -> AUDIO */
 export function VideoToAudio({ tool }) {
   const [files, setFiles] = useState([]);
@@ -11,11 +70,22 @@ export function VideoToAudio({ tool }) {
   const [bitrate, setBitrate] = useState('192');
 
   const run = async () => {
-    const fd = new FormData();
-    files.forEach((f) => fd.append('files', f));
-    fd.append('fmt', fmt); fd.append('bitrate', bitrate);
-    const { blob, filename } = await postForm('/api/media/extract-audio', fd);
-    return [{ blob, filename: filename || `audio.${fmt}`, meta: fmtBytes(blob.size) }];
+    // Prefer the processing service (FFmpeg on Netlify Function proxy or self-hosted backend).
+    try {
+      const fd = new FormData();
+      files.forEach((f) => fd.append('files', f));
+      fd.append('fmt', fmt); fd.append('bitrate', bitrate);
+      const { blob, filename } = await postForm('/api/media/extract-audio', fd);
+      return [{ blob, filename: filename || `audio.${fmt}`, meta: fmtBytes(blob.size) }];
+    } catch (e) {
+      // Static demo without a media backend → decode audio tracks in-browser via WebAudio.
+      if (!/\.(mp[34]|m4a|wav|ogg|flac|aac)$/i.test(files[0].name)) {
+        throw new Error(`${e.message} — In-browser extraction only supports audio files; for MP4/MOV video, connect the free backend (see README).`);
+      }
+      const out = [];
+      for (const f of files) out.push(await extractAudioClient(f, fmt, bitrate));
+      return out.map((r) => ({ ...r, meta: fmtBytes(r.blob.size) }));
+    }
   };
 
   return (
@@ -51,9 +121,13 @@ export function Transcript({ tool }) {
     fd.append('file', files[0]);
     fd.append('language', lang); fd.append('model_size', model);
     const data = await (async () => {
-      const res = await fetch('/api/media/transcribe', { method: 'POST', body: fd });
-      const json = await res.json();
-      if (!res.ok) throw new Error(json.detail || json.error || 'Transcription failed');
+      const res = await fetch(`${API_BASE}/api/media/transcribe`, { method: 'POST', body: fd });
+      let json = null;
+      try { json = await res.json(); } catch { /* non-JSON response */ }
+      if (!res.ok || !json?.text) {
+        throw new Error(json?.detail || json?.error
+          || 'Transcription needs the free self-hosted backend with faster-whisper (see README "Backend hosting"). This static demo cannot run it.');
+      }
       return json;
     })();
     const blob = new Blob([data.text], { type: 'text/plain' });

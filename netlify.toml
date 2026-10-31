@@ -1,29 +1,35 @@
 # ── prymo ToolBox — Netlify configuration ─────────────────────────────
-# The React frontend deploys to Netlify CDN. Heavy file-processing tools are
-# served by the FastAPI backend (Python + Ghostscript + FFmpeg + Whisper).
+# Pure static website on Netlify: React SPA (frontend/dist) + Netlify
+# Functions for the few tools that need server-side code (/api/*).
 #
-# Two hosting paths:
-#   A) Frontend-only demo on Netlify (static): most image/PDF tools run
-#      client-side; server-dependent tools show a friendly notice.
-#   B) Full app: deploy backend anywhere (see README "Backend hosting"),
-#      then set the Netlify env var VITE_API_URL to that origin, e.g.
-#      https://prymo-api.onrender.com  — no code changes needed.
+#   • Image & PDF tools run 100% client-side in the browser (WebAssembly).
+#   • QR/Barcode generation is served by netlify/functions/api.mjs.
+#   • Video→Audio and Transcription optionally proxy to a free self-hosted
+#     FastAPI backend when the env var PRYMO_API_URL is set (see README).
+#   • Set VITE_API_URL at build time only if you want ALL /api traffic to
+#     go straight to that backend, bypassing the functions.
 
 [build]
   base    = "frontend"          # project root for npm (package.json lives here)
-  command = "npm ci && npm run build"
-  publish = "../backend/static" # vite emits the SPA here
+  command = "npm run build"     # netlify.toml [functions] auto-runs `npm install` there
+  publish = "dist"              # plain static SPA output — always exists, no 404s
   functions = "netlify/functions"
 
 [build.environment]
   NODE_VERSION = "20"
-  TAMPER_PROOF = "archive"       # keep absolute paths outside `base` working
 
+# When VITE_API_URL is configured at build time, the SPA calls the remote
+# backend directly (absolute URLs), so this rewrite is not used.
 [[redirects]]
   from = "/api/*"
   to   = "/.netlify/functions/api/:splat"
   status = 200
-  force = false                  # a real backend proxy (VITE_API_URL) wins at runtime
+  force = false
+
+[[redirects]]
+  from = "/docs"
+  to   = "/index.html"
+  status = 200
 
 [[redirects]]
   from = "/*"
