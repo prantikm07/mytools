@@ -17,16 +17,25 @@ export function fmtBytes(n) {
 }
 
 /** POST multipart form and receive the response as a Blob download descriptor. */
+/** Extract a human-readable error from any failed response — JSON {detail},
+ *  plain text, or an HTML page (e.g. a host 404) never leaks into the UI. */
+async function extractError(res) {
+  const ct = (res.headers.get('content-type') || '').toLowerCase();
+  if (ct.includes('json')) {
+    try { return (await res.json()).detail || `Request failed (HTTP ${res.status})`; } catch { /* fall through */ }
+  }
+  if (ct.includes('html')) {
+    return res.status === 404
+      ? 'The processing service is not reachable on this deployment. Please redeploy with Netlify Functions enabled (see README).'
+      : `The server returned an unexpected page (HTTP ${res.status}).`;
+  }
+  const text = ((await res.text().catch(() => '')) || '').slice(0, 300).trim();
+  return text || `Request failed (HTTP ${res.status})`;
+}
+
 export async function postForm(path, formData) {
   const res = await fetch(apiUrl(path), { method: 'POST', body: formData });
-  if (!res.ok) {
-    let detail = `HTTP ${res.status}`;
-    try {
-      const ct = res.headers.get('content-type') || '';
-      detail = ct.includes('json') ? (await res.json()).detail || detail : await res.text() || detail;
-    } catch { /* ignore */ }
-    throw new Error(detail);
-  }
+  if (!res.ok) throw new Error(await extractError(res));
   const cd = res.headers.get('content-disposition') || '';
   const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
   const filename = m ? decodeURIComponent(m[1]) : 'download';
@@ -36,7 +45,7 @@ export async function postForm(path, formData) {
 
 export async function getJSON(path) {
   const res = await fetch(apiUrl(path));
-  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  if (!res.ok) throw new Error(await extractError(res));
   return res.json();
 }
 

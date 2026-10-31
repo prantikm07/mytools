@@ -1,10 +1,15 @@
 import React, { useState } from 'react';
 import { fmtBytes, postForm } from '../api';
+import * as C from '../client';
 import Dropzone from '../components/Dropzone';
 import Workspace from '../components/Workspace';
 import { Chips, Field, NumInput, Select, Slider, Toggle } from '../components/ui';
 
-/* ============================================================ ADVANCED PDF COMPRESSOR */
+const pdfResultsOf = (list) => list.map((r) => ({
+  blob: r.blob, filename: r.filename, preview: null, meta: fmtBytes(r.blob.size),
+}));
+
+/* ============================================================ ADVANCED PDF COMPRESSOR — 100% client-side */
 export function PdfCompressor({ tool }) {
   const [files, setFiles] = useState([]);
   const [preset, setPreset] = useState('');
@@ -14,16 +19,21 @@ export function PdfCompressor({ tool }) {
   const [flatten, setFlatten] = useState(false);
 
   const run = async () => {
-    const fd = new FormData();
-    fd.append('file', files[0]);
-    fd.append('preset', preset);
-    fd.append('dpi', dpi);
-    fd.append('quality', quality);
-    fd.append('grayscale', gray);
-    fd.append('flatten', flatten);
-    const { blob, filename } = await postForm('/api/pdf/compress', fd);
-    return [{ blob, filename: filename || 'compressed.pdf',
-      meta: `${fmtBytes(files[0].size)} → ${fmtBytes(blob.size)} (${Math.max(0, 100 - Math.round((blob.size / files[0].size) * 100))}% saved)` }];
+    const f = files[0];
+    if (!C.isPdfFile(f)) throw new Error('Please add a PDF file.');
+    let out;
+    try {
+      out = await C.pdfCompress(f, { preset, dpi, quality, grayscale: gray });
+    } catch (e) {
+      // Encrypted or exotic PDF → try the serverless/self-hosted API layer.
+      const fd = new FormData();
+      fd.append('file', f); fd.append('preset', preset); fd.append('dpi', dpi);
+      fd.append('quality', quality); fd.append('grayscale', gray); fd.append('flatten', flatten);
+      const { blob, filename } = await postForm('/api/pdf/compress', fd);
+      out = { blob, filename: filename || 'compressed.pdf' };
+      void e;
+    }
+    return [{ ...out, meta: `${fmtBytes(f.size)} → ${fmtBytes(out.blob.size)} (${Math.max(0, 100 - Math.round((out.blob.size / f.size) * 100))}% saved)` }];
   };
 
   return (
@@ -48,13 +58,13 @@ export function PdfCompressor({ tool }) {
           </div>
           <Toggle checked={gray} onChange={setGray} label="Convert to grayscale (massive size reduction)" />
           <Toggle checked={flatten} onChange={setFlatten} label="Flatten form fields & annotations" />
-          <p className="text-xs text-zinc-500">Engine: Ghostscript when available on the server, otherwise PyMuPDF re-encoding. The output is never larger than the input.</p>
+          <p className="text-xs text-zinc-500">Runs entirely in your browser (pdf.js rasterization + rebuild). The output is never larger than the input.</p>
         </div>
       )} run={run} />
   );
 }
 
-/* ============================================================ generic single-file PDF tools */
+/* ============================================================ generic PDF tools — client-side first, API fallback */
 export function PdfTool({ tool }) {
   const [files, setFiles] = useState([]);
   const [mode, setMode] = useState('ranges');
@@ -67,21 +77,43 @@ export function PdfTool({ tool }) {
   const [pageSize, setPageSize] = useState('fit');
   const [password, setPassword] = useState('');
 
-  const path = { merge: '/api/pdf/merge', split: '/api/pdf/split', rotate: '/api/pdf/rotate',
-    pdf2img: '/api/pdf/to-images', img2pdf: '/api/pdf/from-images',
-    protect: '/api/pdf/protect', unlock: '/api/pdf/unlock' }[tool.id];
-
   const run = async () => {
-    const fd = new FormData();
-    if (['merge', 'img2pdf'].includes(tool.id)) files.forEach((f) => fd.append('files', f));
-    else fd.append('file', files[0]);
-    if (tool.id === 'split') { fd.append('mode', mode); fd.append('ranges', ranges); fd.append('every', every); }
-    if (tool.id === 'rotate') { fd.append('angle', angle); fd.append('pages_spec', pagesSpec); }
-    if (tool.id === 'pdf2img') { fd.append('fmt', fmt); fd.append('dpi', dpi); }
-    if (tool.id === 'img2pdf') fd.append('page_size', pageSize);
-    if (['protect', 'unlock'].includes(tool.id)) fd.append('password', password);
-    const { blob, filename } = await postForm(path, fd);
-    return [{ blob, filename: filename || 'result.pdf', meta: fmtBytes(blob.size) }];
+    // Protect / Unlock need real crypto on a server (Netlify Function or self-hosted backend).
+    if (tool.id === 'protect' || tool.id === 'unlock') {
+      if (!password) throw new Error('Enter a password first.');
+      try {
+        const r = await C.pdfProtectOrUnlock(files[0], { password, mode: tool.id });
+        return [{ ...r, meta: fmtBytes(r.blob.size) }];
+      } catch (e) {
+        throw new Error(e.message.includes('http') || e.message.includes('HTTP')
+          ? `${e.message} (Protect/Unlock requires the processing service — see README.)`
+          : e.message);
+      }
+    }
+    // Client-side engines (pdf-lib / pdf.js) handle everything else.
+    switch (tool.id) {
+      case 'merge': {
+        const r = await C.pdfMerge(files);
+        return [{ ...r, meta: fmtBytes(r.blob.size) }];
+      }
+      case 'split': {
+        const rs = await C.pdfSplit(files[0], { mode, ranges, every: +every || 1 });
+        return pdfResultsOf(rs);
+      }
+      case 'rotate': {
+        const r = await C.pdfRotate(files[0], { angle, pagesSpec });
+        return [{ ...r, meta: fmtBytes(r.blob.size) }];
+      }
+      case 'pdf2img': {
+        const rs = await C.pdfToImages(files[0], { dpi, fmt });
+        return pdfResultsOf(rs);
+      }
+      case 'img2pdf': {
+        const r = await C.imagesToPdf(files, { pageSize });
+        return [{ ...r, meta: fmtBytes(r.blob.size) }];
+      }
+      default: throw new Error('Unknown tool');
+    }
   };
 
   const controls = {
@@ -109,7 +141,7 @@ export function PdfTool({ tool }) {
       <Field label="Page size"><Select value={pageSize} onChange={(e) => setPageSize(e.target.value)} options={[
         { value: 'fit', label: 'Fit page to each image' }, { value: 'a4', label: 'Center on A4' }]} /></Field>
     ),
-    protect: () => <Field label="Password" hint="AES-256 via qpdf when installed, else pypdf">
+    protect: () => <Field label="Password" hint="AES-256 encryption via the processing service (open source)">
       <input type="password" className="input" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>,
     unlock: () => <Field label="Current password" hint="Needed to remove protection">
       <input type="password" className="input" value={password} onChange={(e) => setPassword(e.target.value)} /></Field>,
@@ -125,7 +157,7 @@ export function PdfTool({ tool }) {
   );
 }
 
-/* ============================================================ PDF WATERMARK */
+/* ============================================================ PDF WATERMARK — client-side (pdf-lib) */
 export function PdfWatermark({ tool }) {
   const [files, setFiles] = useState([]);
   const [kind, setKind] = useState('text');
@@ -138,18 +170,56 @@ export function PdfWatermark({ tool }) {
   const [rotation, setRotation] = useState(45);
 
   const run = async () => {
-    const fd = new FormData();
-    fd.append('file', files[0]);
-    fd.append('opacity', (opacity / 100).toFixed(2));
-    fd.append('size', size); fd.append('position', position);
-    fd.append('color', color); fd.append('rotate_deg', rotation);
-    if (kind === 'text') fd.append('text', text);
-    else if (wmImage) fd.append('image', wmImage);
-    else throw new Error('Choose a watermark image first.');
-    const { blob, filename } = await postForm('/api/pdf/watermark', fd);
-    return [{ blob, filename: filename || 'watermarked.pdf', meta: fmtBytes(blob.size) }];
+    const opts = {
+      text, opacity: opacity / 100, size, position, color,
+      tile: position === 'tile', rotate: rotation > 0, imageFile: kind === 'image' ? wmImage : null,
+    };
+    if (kind === 'image' && !wmImage) throw new Error('Choose a watermark image first.');
+    let out;
+    try {
+      out = await C.pdfWatermark(files[0], opts);
+    } catch (e) {
+      // Encrypted PDF etc. → fall back to the API layer.
+      const fd = new FormData();
+      fd.append('file', files[0]);
+      fd.append('opacity', (opacity / 100).toFixed(2));
+      fd.append('size', size); fd.append('position', position);
+      fd.append('color', color); fd.append('rotate_deg', rotation);
+      if (kind === 'text') fd.append('text', text); else fd.append('image', wmImage);
+      const { blob, filename } = await postForm('/api/pdf/watermark', fd);
+      out = { blob, filename: filename || 'watermarked.pdf' };
+      void e;
+    }
+    return [{ ...out, meta: fmtBytes(out.blob.size) }];
   };
 
+  return (
+    <Workspace tool={tool} files={files} setFiles={setFiles}
+      DropArea={({ files, onChange }) => <Dropzone accept=".pdf" multiple={false} files={files} onChange={onChange} />}
+      Controls={() => (
+        <div className="space-y-5">
+          <Field label="Compression preset" hint="Presets override the sliders below">
+            <Chips value={preset} onChange={setPreset} options={[
+              { value: '', label: 'Custom' }, { value: 'low', label: 'Low' },
+              { value: 'medium', label: 'Medium' }, { value: 'high', label: 'High' },
+              { value: 'extreme', label: 'Extreme 🔥' }]} />
+          </Field>
+          <div className="grid md:grid-cols-2 gap-x-8 gap-y-5">
+            <Field label="Image downsampling DPI">
+              <Select value={String(dpi)} onChange={(e) => { setDpi(Number(e.target.value)); setPreset(''); }} options={[
+                { value: '300', label: '300 DPI — print quality' }, { value: '150', label: '150 DPI — balanced' },
+                { value: '100', label: '100 DPI — web' }, { value: '72', label: '72 DPI — maximum reduction' }]} />
+            </Field>
+            <Slider label="Embedded image JPEG quality" value={quality} min={1} max={100}
+              onChange={(v) => { setQuality(v); setPreset(''); }} />
+          </div>
+          <Toggle checked={gray} onChange={setGray} label="Convert to grayscale (massive size reduction)" />
+          <Toggle checked={flatten} onChange={setFlatten} label="Flatten form fields & annotations" />
+          <p className="text-xs text-zinc-500">Runs entirely in your browser (pdf.js rasterization + pdf-lib rebuild). The output is never larger than the input.</p>
+        </div>
+      )} run={run} />
+  );
+}
   return (
     <Workspace tool={tool} files={files} setFiles={setFiles}
       DropArea={({ files, onChange }) => <Dropzone accept=".pdf" multiple={false} files={files} onChange={onChange} />}
@@ -175,6 +245,7 @@ export function PdfWatermark({ tool }) {
               <input type="color" value={color} onChange={(e) => setColor(e.target.value)}
                 className="h-10 w-20 rounded-lg bg-transparent border border-white/10 cursor-pointer" /></Field>}
           </div>
+          <p className="text-xs text-zinc-500">Applied locally in your browser with pdf-lib — the PDF never leaves your device.</p>
         </div>
       )} run={run} />
   );

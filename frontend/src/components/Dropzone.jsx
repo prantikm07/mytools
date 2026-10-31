@@ -16,28 +16,38 @@ export default function Dropzone({ accept, multiple = true, files, onChange, tit
         (f.type && ext.includes('/') && f.type === ext)));
     if (!incoming.length) return;
     const next = multiple ? [...files, ...incoming] : incoming.slice(0, 1);
-    onChange(next);
-    // generate thumbnails for images/videos client-side
+    // generate thumbnails for images/videos client-side — keyed by the File object
+    // itself so duplicates with identical name+size each get their own preview.
+    const urls = {};
     incoming.forEach((f) => {
       if (f.type.startsWith('image/')) {
-        const url = URL.createObjectURL(f);
-        setPreviews((p) => ({ ...p, [f.name + f.size]: url }));
+        urls[f.name] = URL.createObjectURL(f);
       } else if (f.type.startsWith('video/')) {
         const url = URL.createObjectURL(f);
         const v = document.createElement('video');
         v.preload = 'metadata'; v.src = url; v.muted = true;
-        v.addEventListener('loadeddata', () => { v.currentTime = Math.min(1, v.duration / 4); });
+        v.addEventListener('loadeddata', () => { v.currentTime = Math.min(1, (v.duration || 2) / 4); });
         v.addEventListener('seeked', () => {
-          const c = document.createElement('canvas');
-          c.width = 96; c.height = 54 * (v.videoHeight / v.videoWidth || 1);
-          c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
           try {
-            setPreviews((p) => ({ ...p, [f.name + f.size]: c.toDataURL() }));
-          } catch { /* ignore */ }
+            const c = document.createElement('canvas');
+            c.width = 96; c.height = Math.max(1, Math.round(54 * (v.videoHeight / v.videoWidth || 1)));
+            c.getContext('2d').drawImage(v, 0, 0, c.width, c.height);
+            setPreviews((p) => ({ ...p, [f.name]: c.toDataURL() }));
+          } catch { /* tainted or unsupported — skip */ }
           URL.revokeObjectURL(url);
         });
       }
     });
+    if (Object.keys(urls).length) {
+      setPreviews((p) => {
+        const np = { ...p };
+        // drop stale entries whose File is no longer in the list
+        const keep = new Set(next.map((f) => f.name));
+        for (const k of Object.keys(np)) if (!keep.has(k)) delete np[k];
+        return { ...np, ...urls };
+      });
+    }
+    onChange(next);
   }, [files, onChange, multiple, accept]);
 
   const onDrop = (e) => {
@@ -45,7 +55,13 @@ export default function Dropzone({ accept, multiple = true, files, onChange, tit
     if (e.dataTransfer.files?.length) addFiles(e.dataTransfer.files);
   };
 
-  const removeAt = (i) => onChange(files.filter((_, idx) => idx !== i));
+  const removeAt = (i) => {
+    const f = files[i];
+    if (f && previews[f.name]?.startsWith('blob:')) URL.revokeObjectURL(previews[f.name]);
+    const next = files.filter((_, idx) => idx !== i);
+    if (f) setPreviews((p) => { const np = { ...p }; delete np[f.name]; return np; });
+    onChange(next);
+  };
 
   const move = (i, dir) => {
     const arr = [...files];
