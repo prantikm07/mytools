@@ -1,0 +1,38 @@
+# ── prymo ToolBox — Netlify configuration ─────────────────────────────
+# The React frontend deploys to Netlify CDN. Heavy file-processing tools are
+# served by the FastAPI backend (Python + Ghostscript + FFmpeg + Whisper).
+#
+# Two hosting paths:
+#   A) Frontend-only demo on Netlify (static): most image/PDF tools run
+#      client-side; server-dependent tools show a friendly notice.
+#   B) Full app: deploy backend anywhere (see README "Backend hosting"),
+#      then set the Netlify env var VITE_API_URL to that origin, e.g.
+#      https://prymo-api.onrender.com  — no code changes needed.
+
+[build]
+  base    = "frontend"          # project root for npm (package.json lives here)
+  command = "npm ci && npm run build"
+  publish = "../backend/static" # vite emits the SPA here
+  functions = "netlify/functions"
+
+[build.environment]
+  NODE_VERSION = "20"
+  TAMPER_PROOF = "archive"       # keep absolute paths outside `base` working
+
+[[redirects]]
+  from = "/api/*"
+  to   = "/.netlify/functions/api/:splat"
+  status = 200
+  force = false                  # a real backend proxy (VITE_API_URL) wins at runtime
+
+[[redirects]]
+  from = "/*"
+  to   = "/index.html"
+  status = 200
+
+[[headers]]
+  for = "/*"
+  [headers.values]
+    X-Content-Type-Options = "nosniff"
+    Referrer-Policy = "no-referrer"
+    Permissions-Policy = "camera=(), microphone=(), geolocation=()"
