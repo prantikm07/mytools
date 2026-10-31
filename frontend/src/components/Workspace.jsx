@@ -19,8 +19,12 @@ export default function Workspace({ tool, files, setFiles, DropArea, Controls, r
     setBusy(true);
     try {
       const out = await run(files);
-      // attach object URLs once (stable across renders)
-      (out || []).forEach((r) => { r.url = URL.createObjectURL(r.blob); });
+      // attach object URLs once (stable across renders); entries without a
+      // blob are "bundles" (e.g. client-side unzip) — give them URLs too.
+      (out || []).forEach((r) => {
+        if (!r.blob && Array.isArray(r.bundle)) r.blob = new Blob([], { type: 'application/octet-stream' });
+        if (r.blob) r.url = URL.createObjectURL(r.blob);
+      });
       setResults(out || []);
     } catch (e) {
       setError(e.message || 'Processing failed');

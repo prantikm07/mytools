@@ -76,10 +76,7 @@ async def unzip(file: UploadFile = File(...)):
 
 
 # ---------------------------------------------------------------- QR code
-@router.post("/qr")
-async def qr(text: str = Form(...), size: int = Form(8), border: int = Form(2),
-             fg: str = Form("#a3e635"), bg: str = Form("#000000"),
-             fmt: str = Form("png")):
+async def _qr_impl(text: str, size: int, border: int, fg: str, bg: str, fmt: str):
     if not text.strip():
         raise HTTPException(400, "Text/URL required")
     import segno
@@ -100,10 +97,25 @@ async def qr(text: str = Form(...), size: int = Form(8), border: int = Form(2),
                     headers={"Content-Disposition": 'attachment; filename="qr.png"'})
 
 
+@router.post("/qr")
+async def qr(text: str = Form(...), size: int = Form(8), border: int = Form(2),
+             fg: str = Form("#a3e635"), bg: str = Form("#000000"),
+             fmt: str = Form("png")):
+    return await _qr_impl(text, size, border, fg, bg, fmt)
+
+
+@router.get("/qr")
+async def qr_get(text: str = "", size: int = 8, border: int = 2,
+                 fg: str = "#a3e635", bg: str = "#000000", fmt: str = "png"):
+    """GET variant (used by serverless hosts such as Netlify Functions)."""
+    return await _qr_impl(text, size, border, fg, bg, fmt)
+
+
 # ---------------------------------------------------------------- Barcode (EAN/Code128...)
-@router.post("/barcode")
-async def barcode(text: str = Form(...), symbology: str = Form("code128"),
-                  height: int = Form(80), width: int = Form(2), fmt: str = Form("png")):
+BARCODE_ALIASES = {"upca": "upc", "itf": "itf14", "ean": "ean13"}
+
+
+async def _barcode_impl(text: str, symbology: str, height: int, width: int, fmt: str):
     if not text.strip():
         raise HTTPException(400, "Data required")
     try:
@@ -111,6 +123,7 @@ async def barcode(text: str = Form(...), symbology: str = Form("code128"),
         from barcode.writer import ImageWriter
     except Exception:
         raise HTTPException(503, "python-barcode not installed on server (pip install python-barcode)")
+    symbology = BARCODE_ALIASES.get(symbology.lower(), symbology.lower())
     cls = barcode.get_barcode_class(symbology)
     if cls is None:
         raise HTTPException(400, f"Unknown symbology '{symbology}'")
@@ -125,6 +138,19 @@ async def barcode(text: str = Form(...), symbology: str = Form("code128"),
     media = "image/png" if fmt == "png" else "image/svg+xml"
     return Response(buf.read(), media_type=media,
                     headers={"Content-Disposition": f'attachment; filename="barcode.{fmt}"'})
+
+
+@router.post("/barcode")
+async def barcode(text: str = Form(...), symbology: str = Form("code128"),
+                  height: int = Form(80), width: int = Form(2), fmt: str = Form("png")):
+    return await _barcode_impl(text, symbology, height, width, fmt)
+
+
+@router.get("/barcode")
+async def barcode_get(text: str = "", symbology: str = "code128",
+                      height: int = 80, width: int = 2, fmt: str = "png"):
+    """GET variant (used by serverless hosts such as Netlify Functions)."""
+    return await _barcode_impl(text, symbology, height, width, fmt)
 
 
 # ---------------------------------------------------------------- Password generator

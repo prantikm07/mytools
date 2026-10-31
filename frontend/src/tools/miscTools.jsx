@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { fmtBytes, getJSON, postForm } from '../api';
+import { API_BASE, fmtBytes, getJSON, postForm } from '../api';
 import Dropzone from '../components/Dropzone';
 import Workspace from '../components/Workspace';
 import { Field, NumInput, Select, Slider, Toggle } from '../components/ui';
@@ -88,23 +88,44 @@ export function Transcript({ tool }) {
   );
 }
 
-/* ============================================================ ZIP maker / extractor */
+/* ============================================================ ZIP maker / extractor (100% client-side via JSZip) */
 export function ZipTool({ tool }) {
   const [files, setFiles] = useState([]);
-  const [compression, setCompression] = useState('deflate');
+  const [compression, setCompression] = useState('DEFLATE');
   const [level, setLevel] = useState(6);
 
   const run = async () => {
-    const fd = new FormData();
+    const { default: JSZip } = await import('jszip');
     if (tool.id === 'zip') {
-      files.forEach((f) => fd.append('files', f));
-      fd.append('compression', compression); fd.append('level', level);
-      const { blob, filename } = await postForm('/api/utils/zip', fd);
-      return [{ blob, filename: filename || 'archive.zip', meta: fmtBytes(blob.size) }];
+      const zip = new JSZip();
+      const used = new Set();
+      files.forEach((f) => {
+        let name = f.name;
+        let i = 1;
+        while (used.has(name)) {
+          const m = /^(.*?)(\.[^.]*)?$/.exec(f.name);
+          name = `${m[1]}(${i})${m[2] || ''}`; i++;
+        }
+        used.add(name);
+        zip.file(name, f);
+      });
+      const blob = await zip.generateAsync({
+        type: 'blob', compression, compressionOptions: { level },
+      });
+      return [{ blob, filename: 'prymo-archive.zip', meta: fmtBytes(blob.size) }];
     }
-    fd.append('file', files[0]);
-    const { blob, filename } = await postForm('/api/utils/unzip', fd);
-    return [{ blob, filename: filename || 'extracted.zip', meta: fmtBytes(blob.size) }];
+    // unzip — with zip-slip-safe names (JSZip sanitizes "../" by default)
+    const zip = await JSZip.loadAsync(files[0]);
+    const entries = Object.values(zip.files).filter((e) => !e.dir);
+    if (!entries.length) throw new Error('ZIP archive is empty');
+    const out = [];
+    for (const e of entries) {
+      const blob = await e.async('blob');
+      out.push({ blob, filename: e.name.split('/').pop() || 'file.bin' });
+    }
+    const total = out.reduce((a, r) => a + r.blob.size, 0);
+    if (out.length === 1) return [{ ...out[0], meta: fmtBytes(total) }];
+    return [{ blob: null, bundle: out, filename: 'extracted.zip', meta: `${out.length} files · ${fmtBytes(total)}` }];
   };
 
   return (
@@ -142,18 +163,26 @@ export function CodeGenerator({ tool }) {
     if (!text.trim()) { setError('Enter some text or a URL.'); return; }
     setBusy(true);
     try {
-      const fd = new FormData();
-      fd.append('text', text);
+      const qs = new URLSearchParams();
       let path;
       if (kind === 'qr') {
         path = '/api/utils/qr';
-        fd.append('size', size); fd.append('fg', fg); fd.append('bg', bg); fd.append('fmt', 'png');
+        qs.set('text', text); qs.set('size', size); qs.set('fg', fg); qs.set('bg', bg); qs.set('fmt', 'png');
       } else {
         path = '/api/utils/barcode';
-        fd.append('symbology', symbology); fd.append('fmt', 'png');
+        qs.set('text', text); qs.set('symbology', symbology); qs.set('fmt', 'png');
       }
-      const out = await postForm(path, fd);
-      setResults(out);
+      const res = await fetch(`${API_BASE}${path}?${qs.toString()}`);
+      if (!res.ok) {
+        let detail = `HTTP ${res.status}`;
+        try { detail = (await res.json()).detail || detail; } catch { /* ignore */ }
+        throw new Error(detail);
+      }
+      const cd = res.headers.get('content-disposition') || '';
+      const m = cd.match(/filename\*?=(?:UTF-8'')?"?([^";]+)"?/i);
+      const filename = m ? decodeURIComponent(m[1]) : (kind === 'qr' ? 'qr-code.png' : 'barcode.png');
+      const blob = await res.blob();
+      setResults({ blob, filename });
     } catch (e) { setError(e.message); } finally { setBusy(false); }
   };
 

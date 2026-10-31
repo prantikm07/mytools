@@ -1,4 +1,12 @@
 // Shared API helpers for prymo ToolBox backend.
+//
+// On Netlify (or any static host) set VITE_API_URL at build time to point the
+// SPA at a deployed FastAPI backend, e.g. https://prymo-api.onrender.com
+// When unset, requests go to same-origin /api (FastAPI serving the SPA, or
+// the Vite dev proxy, or the Netlify Function rewrite).
+export const API_BASE = (import.meta.env.VITE_API_URL || '').replace(/\/+$/, '');
+
+const apiUrl = (path) => (API_BASE ? `${API_BASE}${path}` : path);
 
 export function fmtBytes(n) {
   if (!Number.isFinite(n)) return '—';
@@ -10,7 +18,7 @@ export function fmtBytes(n) {
 
 /** POST multipart form and receive the response as a Blob download descriptor. */
 export async function postForm(path, formData) {
-  const res = await fetch(path, { method: 'POST', body: formData });
+  const res = await fetch(apiUrl(path), { method: 'POST', body: formData });
   if (!res.ok) {
     let detail = `HTTP ${res.status}`;
     try {
@@ -27,7 +35,7 @@ export async function postForm(path, formData) {
 }
 
 export async function getJSON(path) {
-  const res = await fetch(path);
+  const res = await fetch(apiUrl(path));
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   return res.json();
 }
@@ -43,15 +51,21 @@ export function saveBlob(blob, filename) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
-/** Download multiple results; if >1, bundle into one ZIP via JSZip. */
+/** Download multiple results; if >1, bundle into one ZIP via JSZip.
+ *  Entries with a `bundle` array (unzipped contents) expand into the ZIP. */
 export async function downloadResults(results) {
-  if (results.length === 1) {
-    saveBlob(results[0].blob, results[0].filename);
+  const flat = [];
+  for (const r of results) {
+    if (Array.isArray(r.bundle)) flat.push(...r.bundle);
+    else flat.push({ blob: r.blob, filename: r.filename });
+  }
+  if (flat.length === 1) {
+    saveBlob(flat[0].blob, flat[0].filename);
     return;
   }
   const { default: JSZip } = await import('jszip');
   const zip = new JSZip();
-  results.forEach((r, i) => {
+  flat.forEach((r, i) => {
     let name = r.filename;
     if (zip.files[name]) name = name.replace(/(\.[^.]+)?$/, `-${i}$1`);
     zip.file(name, r.blob);
